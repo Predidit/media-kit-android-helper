@@ -7,6 +7,7 @@
 cmake_minimum_required(VERSION 3.22.1)
 
 project("mediakitandroidhelper")
+add_link_options("LINKER:--build-id=none")
 
 add_library(mediakitandroidhelper SHARED native-lib.cpp)
 
