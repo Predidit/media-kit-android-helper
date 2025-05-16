@@ -10,6 +10,7 @@ project("mediakitandroidhelper")
 add_link_options("LINKER:--build-id=none")
 
 add_library(mediakitandroidhelper SHARED native-lib.cpp)
+target_link_options(mediakitandroidhelper PRIVATE "-Wl,-z,max-page-size=16384")
 
 find_library(log-lib log)
 find_library(android-lib android)
