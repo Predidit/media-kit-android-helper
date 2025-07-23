@@ -41,11 +41,4 @@ public class MediaKitAndroidHelper {
             return -1;
         }
     }
-
-    public static native void cleanup();
-
-    public static void cleanupJava() {
-        cleanup();
-        applicationContext = null;
-    }
 }
