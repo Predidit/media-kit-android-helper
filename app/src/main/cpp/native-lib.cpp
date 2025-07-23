@@ -12,9 +12,9 @@
 
 #include <unistd.h>
 
-#include <future>
 #include <string>
-#include <thread>
+#include <memory>
+#include <algorithm>
 
 // ------------------------------------------------------------
 // Globals. For sharing necessary values between Java & Dart.
@@ -25,6 +25,7 @@ char* g_files_dir = NULL;
 int8_t g_is_emulator = -1;
 AAssetManager* g_asset_manager = NULL;
 jclass g_media_kit_android_helper_class = NULL;
+jobject g_asset_manager_global_ref = NULL;
 
 // ------------------------------------------------------------
 // Native. For access through Dart FFI.
@@ -34,24 +35,38 @@ extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperCo
     strcpy(result, "");
 
     if (g_jvm == NULL) {
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "JavaVM* is nullptr.");
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "JavaVM* is nullptr.");
         return;
     }
     if (g_asset_manager == NULL) {
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "AAssetManager* is nullptr.");
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "AAssetManager* is nullptr.");
+        return;
+    }
+    if (g_files_dir == NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Files directory is nullptr.");
         return;
     }
 
     AAsset* asset = AAssetManager_open(g_asset_manager, asset_name, AASSET_MODE_BUFFER);
 
     if (asset == NULL) {
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "NOT FOUND: %s", asset_name);
+        __android_log_print(ANDROID_LOG_WARNING, "media_kit", "Asset not found: %s", asset_name);
         return;
     }
 
     off_t length = AAsset_getLength(asset);
+    if (length <= 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Invalid asset length: %ld", length);
+        AAsset_close(asset);
+        return;
+    }
 
     auto buffer = std::make_unique<uint8_t[]>(length);
+    if (!buffer) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to allocate buffer for asset");
+        AAsset_close(asset);
+        return;
+    }
 
     int32_t size = AAsset_read(asset, buffer.get(), length);
 
@@ -59,6 +74,11 @@ extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperCo
     __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Asset size: %d", size);
 
     AAsset_close(asset);
+
+    if (size != length) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to read complete asset. Expected: %ld, Read: %d", length, size);
+        return;
+    }
 
     std::string directory_out = g_files_dir;
     directory_out += "/com.alexmercerind.media_kit/";
@@ -72,27 +92,50 @@ extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperCo
     int32_t stat_result = stat(directory_out.c_str(), &st);
     if (stat_result == -1) {
         __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Creating asset directory...");
-        mkdir(directory_out.c_str(), 0777);
+        if (mkdir(directory_out.c_str(), 0777) != 0) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to create asset directory");
+            return;
+        }
     } else {
         __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Asset directory exists.");
     }
 
     __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Asset file: %s", output_file.c_str());
 
-    FILE* file = fopen(output_file.c_str(), "rb");
-    if (file != NULL) {
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Asset file exists.");
-        fclose(file);
-    } else {
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Creating asset file...");
-        file = fopen(output_file.c_str(), "wb");
-        if (file != NULL) {
-            fwrite(buffer.get(), sizeof(uint8_t), size, file);
-            fclose(file);
+    // Check if file already exists and has correct size
+    FILE* existing_file = fopen(output_file.c_str(), "rb");
+    if (existing_file != NULL) {
+        fseek(existing_file, 0, SEEK_END);
+        long existing_size = ftell(existing_file);
+        fclose(existing_file);
+        
+        if (existing_size == size) {
+            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Asset file exists with correct size.");
+            strncpy(result, output_file.c_str(), 2047);
+            result[2047] = '\0';
+            return;
+        } else {
+            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "Asset file exists but size mismatch, recreating...");
         }
     }
 
-    strcpy(result, output_file.c_str());
+    // Create/overwrite the file
+    FILE* file = fopen(output_file.c_str(), "wb");
+    if (file == NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to create asset file: %s", output_file.c_str());
+        return;
+    }
+
+    size_t written = fwrite(buffer.get(), sizeof(uint8_t), size, file);
+    fclose(file);
+
+    if (written != (size_t)size) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to write complete asset. Expected: %d, Written: %zu", size, written);
+        return;
+    }
+
+    strncpy(result, output_file.c_str(), 2047);
+    result[2047] = '\0';
 }
 
 extern "C" __attribute__ ((visibility ("default"))) void* MediaKitAndroidHelperGetJavaVM() {
@@ -112,53 +155,114 @@ extern "C" __attribute__ ((visibility ("default"))) int32_t MediaKitAndroidHelpe
 }
 
 extern "C" __attribute__ ((visibility ("default"))) int32_t MediaKitAndroidHelperOpenFileDescriptor(const char* uri) {
-    auto file_descriptor_promise = std::promise<int32_t>{};
-    std::thread([&] () {
-        if (g_jvm != NULL && g_media_kit_android_helper_class != NULL) {
-            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "MediaKitAndroidHelperOpenFileDescriptor: %s", uri);
-            JNIEnv* env = NULL;
-            bool attached = false;
-            jint get_env_result = g_jvm->GetEnv((void**)env, JNI_VERSION_1_6);
+    if (g_jvm == NULL || g_media_kit_android_helper_class == NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "MediaKitAndroidHelperOpenFileDescriptor: Missing initialization");
+        return -1;
+    }
+    
+    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "MediaKitAndroidHelperOpenFileDescriptor: %s", uri);
+    
+    JNIEnv* env = NULL;
+    bool attached = false;
+    jint get_env_result = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
 
-            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "get_env_result = %d", get_env_result);
+    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "get_env_result = %d", get_env_result);
 
-            if (get_env_result != JNI_OK) {
-                if (g_jvm->AttachCurrentThread(&env, NULL) == JNI_OK) {
-                    attached = true;
-                    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "JavaVM::AttachCurrentThread Success");
-                } else {
-                    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "JavaVM::AttachCurrentThread Failure");
-                }
-            }
+    if (get_env_result != JNI_OK) {
+        if (g_jvm->AttachCurrentThread(&env, NULL) == JNI_OK) {
+            attached = true;
+            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "JavaVM::AttachCurrentThread Success");
+        } else {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "JavaVM::AttachCurrentThread Failure");
+            return -1;
+        }
+    }
 
-            if (env == NULL) {
-                __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "env = NULL");
-            }
-            if (env != NULL) {
-                jstring uri_jstring = env->NewStringUTF(uri);
-
-                jmethodID open_file_descriptor_method_id = env->GetStaticMethodID(g_media_kit_android_helper_class, "openFileDescriptorJava", "(Ljava/lang/String;)I");
-                jint file_descriptor = env->CallStaticIntMethod(g_media_kit_android_helper_class, open_file_descriptor_method_id, uri_jstring);
-
+    if (env == NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "env = NULL");
+        return -1;
+    }
+    
+    int32_t file_descriptor = -1;
+    jstring uri_jstring = NULL;
+    
+    try {
+        uri_jstring = env->NewStringUTF(uri);
+        if (uri_jstring == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to create URI string");
+        } else {
+            jmethodID open_file_descriptor_method_id = env->GetStaticMethodID(g_media_kit_android_helper_class, "openFileDescriptorJava", "(Ljava/lang/String;)I");
+            if (open_file_descriptor_method_id != NULL) {
+                file_descriptor = env->CallStaticIntMethod(g_media_kit_android_helper_class, open_file_descriptor_method_id, uri_jstring);
                 __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "file_descriptor = %d", file_descriptor);
-
-                env->DeleteLocalRef(uri_jstring);
-
-                if (attached) {
-                    g_jvm->DetachCurrentThread();
-                }
-
-                file_descriptor_promise.set_value(file_descriptor);
-                return;
+            } else {
+                __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get method ID for openFileDescriptorJava");
             }
         }
-        file_descriptor_promise.set_value(-1);
-    }).detach();
-    return file_descriptor_promise.get_future().get();
+    } catch (...) {
+        __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Exception in MediaKitAndroidHelperOpenFileDescriptor");
+        file_descriptor = -1;
+    }
+    
+    // Cleanup
+    if (uri_jstring != NULL) {
+        env->DeleteLocalRef(uri_jstring);
+    }
+    
+    // Check for exceptions
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        file_descriptor = -1;
+    }
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+
+    return file_descriptor;
 }
 
 extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperCloseFileDescriptor(int32_t file_descriptor) {
     close(file_descriptor);
+}
+
+extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperCleanup() {
+    if (g_files_dir != NULL) {
+        delete[] g_files_dir;
+        g_files_dir = NULL;
+    }
+    
+    if (g_jvm != NULL && g_asset_manager_global_ref != NULL) {
+        JNIEnv* env = NULL;
+        bool attached = false;
+        jint get_env_result = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+        
+        if (get_env_result != JNI_OK) {
+            if (g_jvm->AttachCurrentThread(&env, NULL) == JNI_OK) {
+                attached = true;
+            }
+        }
+        
+        if (env != NULL) {
+            if (g_asset_manager_global_ref != NULL) {
+                env->DeleteGlobalRef(g_asset_manager_global_ref);
+                g_asset_manager_global_ref = NULL;
+            }
+            
+            if (g_media_kit_android_helper_class != NULL) {
+                env->DeleteGlobalRef(g_media_kit_android_helper_class);
+                g_media_kit_android_helper_class = NULL;
+            }
+            
+            if (attached) {
+                g_jvm->DetachCurrentThread();
+            }
+        }
+    }
+    
+    g_asset_manager = NULL;
+    g_is_emulator = -1;
 }
 
 // ------------------------------------------------------------
@@ -192,6 +296,10 @@ Java_com_alexmercerind_mediakitandroidhelper_MediaKitAndroidHelper_setApplicatio
         g_is_emulator = 0;
 
         jclass build_class = env->FindClass("android/os/Build");
+        if (build_class == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to find Build class");
+            return;
+        }
 
         char brand_chars[1024];
         char device_chars[1024];
@@ -209,61 +317,56 @@ Java_com_alexmercerind_mediakitandroidhelper_MediaKitAndroidHelper_setApplicatio
         memset(manufacturer_chars, '\0', 1024);
         memset(product_chars, '\0', 1024);
 
-        jfieldID brand_field_id = env->GetStaticFieldID(build_class, "BRAND", "Ljava/lang/String;");
-        jstring brand_jstring = (jstring)env->GetStaticObjectField(build_class, brand_field_id);
-        const char* source_brand_chars = env->GetStringUTFChars(brand_jstring, NULL);
-        if (source_brand_chars != NULL) {
-            strncpy(brand_chars, source_brand_chars, 1024);
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s", brand_chars);
+        // Helper lambda for safe string extraction
+        auto safeGetString = [&](const char* fieldName) -> bool {
+            jfieldID field_id = env->GetStaticFieldID(build_class, fieldName, "Ljava/lang/String;");
+            if (field_id == NULL) {
+                __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get field ID for %s", fieldName);
+                return false;
+            }
+            
+            jstring jstr = (jstring)env->GetStaticObjectField(build_class, field_id);
+            if (jstr == NULL) {
+                __android_log_print(ANDROID_LOG_WARNING, "media_kit", "Field %s is null", fieldName);
+                return false;
+            }
+            
+            const char* str_chars = env->GetStringUTFChars(jstr, NULL);
+            if (str_chars == NULL) {
+                env->DeleteLocalRef(jstr);
+                return false;
+            }
+            
+            char* target_buffer = nullptr;
+            if (strcmp(fieldName, "BRAND") == 0) target_buffer = brand_chars;
+            else if (strcmp(fieldName, "DEVICE") == 0) target_buffer = device_chars;
+            else if (strcmp(fieldName, "FINGERPRINT") == 0) target_buffer = fingerprint_chars;
+            else if (strcmp(fieldName, "HARDWARE") == 0) target_buffer = hardware_chars;
+            else if (strcmp(fieldName, "MODEL") == 0) target_buffer = model_chars;
+            else if (strcmp(fieldName, "MANUFACTURER") == 0) target_buffer = manufacturer_chars;
+            else if (strcmp(fieldName, "PRODUCT") == 0) target_buffer = product_chars;
+            
+            if (target_buffer != nullptr) {
+                strncpy(target_buffer, str_chars, 1023);
+                target_buffer[1023] = '\0';  // Ensure null termination
+            }
+            
+            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s: %s", fieldName, target_buffer ? target_buffer : "null");
+            
+            env->ReleaseStringUTFChars(jstr, str_chars);
+            env->DeleteLocalRef(jstr);
+            
+            return true;
+        };
 
-        jfieldID device_field_id = env->GetStaticFieldID(build_class, "DEVICE", "Ljava/lang/String;");
-        jstring device_jstring = (jstring)env->GetStaticObjectField(build_class, device_field_id);
-        const char* source_device_chars = env->GetStringUTFChars(device_jstring, NULL);
-        if (source_device_chars != NULL) {
-            strncpy(device_chars, source_device_chars, 1024);
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s", device_chars);
-
-        jfieldID fingerprint_field_id = env->GetStaticFieldID(build_class, "FINGERPRINT", "Ljava/lang/String;");
-        jstring fingerprint_jstring = (jstring)env->GetStaticObjectField(build_class, fingerprint_field_id);
-        const char* source_fingerprint_chars = env->GetStringUTFChars(fingerprint_jstring, NULL);
-        if (source_fingerprint_chars != NULL) {
-            strncpy(fingerprint_chars, source_fingerprint_chars, 1024);
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s", fingerprint_chars);
-
-        jfieldID hardware_field_id = env->GetStaticFieldID(build_class, "HARDWARE", "Ljava/lang/String;");
-        jstring hardware_jstring = (jstring)env->GetStaticObjectField(build_class, hardware_field_id);
-        const char* source_hardware_chars = env->GetStringUTFChars(hardware_jstring, NULL);
-        if (source_hardware_chars != NULL) {
-            strncpy(hardware_chars, source_hardware_chars, 1024);
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s", hardware_chars);
-
-        jfieldID model_field_id = env->GetStaticFieldID(build_class, "MODEL", "Ljava/lang/String;");
-        jstring model_jstring = (jstring)env->GetStaticObjectField(build_class, model_field_id);
-        const char* source_model_chars = env->GetStringUTFChars(model_jstring, NULL);
-        if (source_model_chars != NULL) {
-            strncpy(model_chars, source_model_chars, 1024);
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s", model_chars);
-
-        jfieldID manufacturer_field_id = env->GetStaticFieldID(build_class, "MANUFACTURER", "Ljava/lang/String;");
-        jstring manufacturer_jstring = (jstring)env->GetStaticObjectField(build_class, manufacturer_field_id);
-        const char* source_manufacturer_chars = env->GetStringUTFChars(manufacturer_jstring, NULL);
-        if (source_manufacturer_chars != NULL) {
-            strncpy(manufacturer_chars, source_manufacturer_chars, 1024);
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s", manufacturer_chars);
-
-        jfieldID product_field_id = env->GetStaticFieldID(build_class, "PRODUCT", "Ljava/lang/String;");
-        jstring product_jstring = (jstring)env->GetStaticObjectField(build_class, product_field_id);
-        const char* source_product_chars = env->GetStringUTFChars(product_jstring, NULL);
-        if (source_product_chars != NULL) {
-            strncpy(product_chars, source_product_chars, 1024);
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "%s", product_chars);
+        // Extract all build properties safely
+        safeGetString("BRAND");
+        safeGetString("DEVICE");
+        safeGetString("FINGERPRINT");
+        safeGetString("HARDWARE");
+        safeGetString("MODEL");
+        safeGetString("MANUFACTURER");
+        safeGetString("PRODUCT");
 
         if (
                 (strncmp(brand_chars, "generic", strlen("generic")) == 0 && strncmp(device_chars, "generic", strlen("generic")) == 0)
@@ -285,78 +388,137 @@ Java_com_alexmercerind_mediakitandroidhelper_MediaKitAndroidHelper_setApplicatio
             g_is_emulator = 1;
         }
 
-        env->ReleaseStringUTFChars(brand_jstring, source_brand_chars);
-        env->ReleaseStringUTFChars(device_jstring, source_device_chars);
-        env->ReleaseStringUTFChars(fingerprint_jstring, source_fingerprint_chars);
-        env->ReleaseStringUTFChars(hardware_jstring, source_hardware_chars);
-        env->ReleaseStringUTFChars(model_jstring, source_model_chars);
-        env->ReleaseStringUTFChars(manufacturer_jstring, source_manufacturer_chars);
-        env->ReleaseStringUTFChars(product_jstring, source_product_chars);
-
-        env->DeleteLocalRef(brand_jstring);
-        env->DeleteLocalRef(device_jstring);
-        env->DeleteLocalRef(fingerprint_jstring);
-        env->DeleteLocalRef(hardware_jstring);
-        env->DeleteLocalRef(model_jstring);
-        env->DeleteLocalRef(manufacturer_jstring);
-        env->DeleteLocalRef(product_jstring);
+        env->DeleteLocalRef(build_class);
     }
 
     // g_files_dir
 
     if (g_files_dir == NULL) {
 
-        g_files_dir = new char[2048];
+        g_files_dir = new(std::nothrow) char[2048];
+        if (g_files_dir == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to allocate memory for files directory");
+            return;
+        }
         memset(g_files_dir, '\0', 2048);
 
         jclass context_class = env->GetObjectClass(context);
+        if (context_class == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get context class");
+            delete[] g_files_dir;
+            g_files_dir = NULL;
+            return;
+        }
+        
         jmethodID get_files_dir_method_id = env->GetMethodID(context_class, "getFilesDir", "()Ljava/io/File;");
+        if (get_files_dir_method_id == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get getFilesDir method");
+            env->DeleteLocalRef(context_class);
+            delete[] g_files_dir;
+            g_files_dir = NULL;
+            return;
+        }
+        
         jobject files_dir_jobject = env->CallObjectMethod(context, get_files_dir_method_id);
 
         if (env->IsSameObject(files_dir_jobject, NULL)) {
             if (android_get_device_api_level() >= 24) {
                 jmethodID get_data_dir_method_id = env->GetMethodID(context_class, "getDataDir", "()Ljava/io/File;");
-                files_dir_jobject = env->CallObjectMethod(context, get_data_dir_method_id);
+                if (get_data_dir_method_id != NULL) {
+                    files_dir_jobject = env->CallObjectMethod(context, get_data_dir_method_id);
+                }
             } else {
                 jmethodID get_application_info_method_id = env->GetMethodID(context_class, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
-                jobject application_info_jobject = env->CallObjectMethod(context, get_application_info_method_id);
-                jclass application_info_class = env->GetObjectClass(application_info_jobject);
-                jfieldID data_dir_field = env->GetFieldID(application_info_class, "dataDir", "Ljava/lang/String;");
-                jobject data_dir_jobject = env->GetObjectField(application_info_jobject, data_dir_field);
+                if (get_application_info_method_id != NULL) {
+                    jobject application_info_jobject = env->CallObjectMethod(context, get_application_info_method_id);
+                    if (application_info_jobject != NULL) {
+                        jclass application_info_class = env->GetObjectClass(application_info_jobject);
+                        if (application_info_class != NULL) {
+                            jfieldID data_dir_field = env->GetFieldID(application_info_class, "dataDir", "Ljava/lang/String;");
+                            if (data_dir_field != NULL) {
+                                jobject data_dir_jobject = env->GetObjectField(application_info_jobject, data_dir_field);
 
-                jclass file_class = env->FindClass("java/io/File");
-                jmethodID file_constructor = env->GetMethodID(file_class, "<init>", "(Ljava/lang/String;)V");
+                                jclass file_class = env->FindClass("java/io/File");
+                                if (file_class != NULL) {
+                                    jmethodID file_constructor = env->GetMethodID(file_class, "<init>", "(Ljava/lang/String;)V");
+                                    if (file_constructor != NULL) {
+                                        files_dir_jobject = env->NewObject(file_class, file_constructor, data_dir_jobject);
+                                    }
+                                    env->DeleteLocalRef(file_class);
+                                }
 
-                files_dir_jobject = env->NewObject(file_class, file_constructor, data_dir_jobject);
-
-                env->DeleteLocalRef(application_info_jobject);
-                env->DeleteLocalRef(data_dir_jobject);
+                                if (data_dir_jobject != NULL) {
+                                    env->DeleteLocalRef(data_dir_jobject);
+                                }
+                            }
+                            env->DeleteLocalRef(application_info_class);
+                        }
+                        env->DeleteLocalRef(application_info_jobject);
+                    }
+                }
             }
         }
 
-        jmethodID get_absolute_path_method_id = env->GetMethodID(env->FindClass("java/io/File"), "getAbsolutePath", "()Ljava/lang/String;");
-        jstring files_dir_jstring = (jstring)env->CallObjectMethod(files_dir_jobject, get_absolute_path_method_id);
-
-        const char* files_dir_chars = env->GetStringUTFChars(files_dir_jstring, NULL);
-
-        strncpy(g_files_dir, files_dir_chars, 2048);
-
-        env->ReleaseStringUTFChars(files_dir_jstring, files_dir_chars);
-
-        env->DeleteLocalRef(files_dir_jobject);
-        env->DeleteLocalRef(files_dir_jstring);
+        if (files_dir_jobject != NULL) {
+            jclass file_class = env->FindClass("java/io/File");
+            if (file_class != NULL) {
+                jmethodID get_absolute_path_method_id = env->GetMethodID(file_class, "getAbsolutePath", "()Ljava/lang/String;");
+                if (get_absolute_path_method_id != NULL) {
+                    jstring files_dir_jstring = (jstring)env->CallObjectMethod(files_dir_jobject, get_absolute_path_method_id);
+                    if (files_dir_jstring != NULL) {
+                        const char* files_dir_chars = env->GetStringUTFChars(files_dir_jstring, NULL);
+                        if (files_dir_chars != NULL) {
+                            strncpy(g_files_dir, files_dir_chars, 2047);
+                            g_files_dir[2047] = '\0';  // Ensure null termination
+                            env->ReleaseStringUTFChars(files_dir_jstring, files_dir_chars);
+                        }
+                        env->DeleteLocalRef(files_dir_jstring);
+                    }
+                }
+                env->DeleteLocalRef(file_class);
+            }
+            env->DeleteLocalRef(files_dir_jobject);
+        }
+        
+        env->DeleteLocalRef(context_class);
+        
+        // If we failed to get the files directory, clean up
+        if (strlen(g_files_dir) == 0) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get files directory");
+            delete[] g_files_dir;
+            g_files_dir = NULL;
+        }
     }
 
     // g_asset_manager
 
     if (g_asset_manager == NULL) {
         jclass context_class = env->GetObjectClass(context);
+        if (context_class == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get context class");
+            return;
+        }
+        
         jmethodID asset_manager_id = env->GetMethodID(context_class, "getAssets", "()Landroid/content/res/AssetManager;");
+        if (asset_manager_id == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get getAssets method");
+            env->DeleteLocalRef(context_class);
+            return;
+        }
+        
         jobject asset_manager_jobject = env->CallObjectMethod(context, asset_manager_id);
+        if (asset_manager_jobject == NULL) {
+            __android_log_print(ANDROID_LOG_ERROR, "media_kit", "Failed to get asset manager");
+            env->DeleteLocalRef(context_class);
+            return;
+        }
 
-        g_asset_manager = AAssetManager_fromJava(env, env->NewGlobalRef(asset_manager_jobject));
+        // Store global reference for proper cleanup
+        g_asset_manager_global_ref = env->NewGlobalRef(asset_manager_jobject);
+        g_asset_manager = AAssetManager_fromJava(env, g_asset_manager_global_ref);
 
         env->DeleteLocalRef(asset_manager_jobject);
+        env->DeleteLocalRef(context_class);
     }
 
     // g_media_kit_android_helper_class
@@ -380,8 +542,23 @@ Java_com_alexmercerind_mediakitandroidhelper_MediaKitAndroidHelper_openFileDescr
         JNIEnv *env, jclass clazz, jstring uri) {
     if (g_media_kit_android_helper_class != NULL) {
         jmethodID open_file_descriptor_method_id = env->GetStaticMethodID(g_media_kit_android_helper_class, "openFileDescriptorJava", "(Ljava/lang/String;)I");
-        jint file_descriptor = env->CallStaticIntMethod(g_media_kit_android_helper_class, open_file_descriptor_method_id, uri);
-        return file_descriptor;
+        if (open_file_descriptor_method_id != NULL) {
+            jint file_descriptor = env->CallStaticIntMethod(g_media_kit_android_helper_class, open_file_descriptor_method_id, uri);
+            
+            // Check for exceptions
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                return -1;
+            }
+            
+            return file_descriptor;
+        }
     }
     return -1;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_alexmercerind_mediakitandroidhelper_MediaKitAndroidHelper_cleanup(JNIEnv *env, jclass clazz) {
+    MediaKitAndroidHelperCleanup();
 }
