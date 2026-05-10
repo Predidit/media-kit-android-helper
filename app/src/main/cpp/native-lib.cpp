@@ -10,11 +10,19 @@
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 
+#include <dlfcn.h>
 #include <unistd.h>
 
-#include <future>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 // ------------------------------------------------------------
 // Globals. For sharing necessary values between Java & Dart.
@@ -25,6 +33,52 @@ char* g_files_dir = NULL;
 int8_t g_is_emulator = -1;
 AAssetManager* g_asset_manager = NULL;
 jclass g_media_kit_android_helper_class = NULL;
+
+// ------------------------------------------------------------
+// Async libmpv initialization jobs.
+// ------------------------------------------------------------
+
+typedef void* (*mpv_create_fn)();
+typedef int32_t (*mpv_set_option_string_fn)(void*, const char*, const char*);
+typedef int32_t (*mpv_initialize_fn)(void*);
+typedef void (*mpv_terminate_destroy_fn)(void*);
+
+struct MpvInitializeJob {
+    int32_t status = 0;
+    void* handle = NULL;
+    void* library = NULL;
+    bool claimed = false;
+    bool cancelled = false;
+    std::string error;
+};
+
+std::mutex g_mpv_initialize_jobs_mutex;
+std::unordered_map<int64_t, std::shared_ptr<MpvInitializeJob>> g_mpv_initialize_jobs;
+std::atomic<int64_t> g_next_mpv_initialize_job_id(1);
+
+static void MediaKitAndroidHelperMpvInitializeAsyncDestroyHandleLocked(
+        const std::shared_ptr<MpvInitializeJob>& job) {
+    if (job == nullptr || job->handle == NULL || job->library == NULL) {
+        return;
+    }
+    mpv_terminate_destroy_fn mpv_terminate_destroy =
+            reinterpret_cast<mpv_terminate_destroy_fn>(dlsym(job->library, "mpv_terminate_destroy"));
+    if (mpv_terminate_destroy != NULL) {
+        mpv_terminate_destroy(job->handle);
+    }
+    job->handle = NULL;
+}
+
+static void MediaKitAndroidHelperMpvInitializeAsyncEraseIfCancelledLocked(
+        int64_t job_id,
+        const std::shared_ptr<MpvInitializeJob>& job) {
+    // Cancellation is fire-and-forget from Dart: callers are not required to
+    // keep polling and dispose a second time. Once the worker reaches any
+    // terminal state, it owns removing cancelled jobs from the map.
+    if (job != nullptr && job->cancelled) {
+        g_mpv_initialize_jobs.erase(job_id);
+    }
+}
 
 // ------------------------------------------------------------
 // Native. For access through Dart FFI.
@@ -112,53 +166,236 @@ extern "C" __attribute__ ((visibility ("default"))) int32_t MediaKitAndroidHelpe
 }
 
 extern "C" __attribute__ ((visibility ("default"))) int32_t MediaKitAndroidHelperOpenFileDescriptor(const char* uri) {
-    auto file_descriptor_promise = std::promise<int32_t>{};
-    std::thread([&] () {
-        if (g_jvm != NULL && g_media_kit_android_helper_class != NULL) {
-            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "MediaKitAndroidHelperOpenFileDescriptor: %s", uri);
-            JNIEnv* env = NULL;
-            bool attached = false;
-            jint get_env_result = g_jvm->GetEnv((void**)env, JNI_VERSION_1_6);
+    if (g_jvm == NULL || g_media_kit_android_helper_class == NULL || uri == NULL) {
+        return -1;
+    }
 
-            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "get_env_result = %d", get_env_result);
+    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "MediaKitAndroidHelperOpenFileDescriptor: %s", uri);
 
-            if (get_env_result != JNI_OK) {
-                if (g_jvm->AttachCurrentThread(&env, NULL) == JNI_OK) {
-                    attached = true;
-                    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "JavaVM::AttachCurrentThread Success");
-                } else {
-                    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "JavaVM::AttachCurrentThread Failure");
-                }
-            }
+    JNIEnv* env = NULL;
+    bool attached = false;
+    jint get_env_result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
 
-            if (env == NULL) {
-                __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "env = NULL");
-            }
-            if (env != NULL) {
-                jstring uri_jstring = env->NewStringUTF(uri);
-
-                jmethodID open_file_descriptor_method_id = env->GetStaticMethodID(g_media_kit_android_helper_class, "openFileDescriptorJava", "(Ljava/lang/String;)I");
-                jint file_descriptor = env->CallStaticIntMethod(g_media_kit_android_helper_class, open_file_descriptor_method_id, uri_jstring);
-
-                __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "file_descriptor = %d", file_descriptor);
-
-                env->DeleteLocalRef(uri_jstring);
-
-                if (attached) {
-                    g_jvm->DetachCurrentThread();
-                }
-
-                file_descriptor_promise.set_value(file_descriptor);
-                return;
-            }
+    if (get_env_result != JNI_OK) {
+        if (g_jvm->AttachCurrentThread(&env, NULL) == JNI_OK) {
+            attached = true;
+        } else {
+            __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "JavaVM::AttachCurrentThread Failure");
+            return -1;
         }
-        file_descriptor_promise.set_value(-1);
-    }).detach();
-    return file_descriptor_promise.get_future().get();
+    }
+
+    jint file_descriptor = -1;
+    if (env != NULL) {
+        jstring uri_jstring = env->NewStringUTF(uri);
+        jmethodID open_file_descriptor_method_id = env->GetStaticMethodID(
+                g_media_kit_android_helper_class,
+                "openFileDescriptorJava",
+                "(Ljava/lang/String;)I");
+        file_descriptor = env->CallStaticIntMethod(
+                g_media_kit_android_helper_class,
+                open_file_descriptor_method_id,
+                uri_jstring);
+        env->DeleteLocalRef(uri_jstring);
+    }
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+
+    __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "file_descriptor = %d", file_descriptor);
+    return file_descriptor;
 }
 
 extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperCloseFileDescriptor(int32_t file_descriptor) {
     close(file_descriptor);
+}
+
+extern "C" __attribute__ ((visibility ("default"))) int64_t MediaKitAndroidHelperMpvInitializeAsyncStart(
+        const char* libmpv,
+        const char** keys,
+        const char** values,
+        int32_t count) {
+    const int64_t job_id = g_next_mpv_initialize_job_id.fetch_add(1);
+    auto job = std::make_shared<MpvInitializeJob>();
+    std::string library_name = (libmpv != NULL && strlen(libmpv) > 0) ? libmpv : "libmpv.so";
+    std::vector<std::pair<std::string, std::string>> options;
+
+    if (count > 0 && keys != NULL && values != NULL) {
+        options.reserve(count);
+        for (int32_t i = 0; i < count; i++) {
+            if (keys[i] != NULL && values[i] != NULL) {
+                options.emplace_back(keys[i], values[i]);
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+        g_mpv_initialize_jobs[job_id] = job;
+    }
+
+    std::thread([job_id, job, library_name, options] () {
+        const auto started_at = std::chrono::steady_clock::now();
+        __android_log_print(ANDROID_LOG_DEBUG, "media_kit", "mpv async init start: %lld", (long long)job_id);
+
+        void* library = dlopen(library_name.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (library == NULL) {
+            std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+            job->status = -1;
+            const char* error = dlerror();
+            job->error = error != NULL ? error : "dlopen failed";
+            MediaKitAndroidHelperMpvInitializeAsyncEraseIfCancelledLocked(job_id, job);
+            return;
+        }
+
+        mpv_create_fn mpv_create = reinterpret_cast<mpv_create_fn>(dlsym(library, "mpv_create"));
+        mpv_set_option_string_fn mpv_set_option_string =
+                reinterpret_cast<mpv_set_option_string_fn>(dlsym(library, "mpv_set_option_string"));
+        mpv_initialize_fn mpv_initialize =
+                reinterpret_cast<mpv_initialize_fn>(dlsym(library, "mpv_initialize"));
+
+        if (mpv_create == NULL || mpv_set_option_string == NULL || mpv_initialize == NULL) {
+            std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+            job->library = library;
+            job->status = -2;
+            job->error = "failed to resolve libmpv symbols";
+            dlclose(library);
+            job->library = NULL;
+            MediaKitAndroidHelperMpvInitializeAsyncEraseIfCancelledLocked(job_id, job);
+            return;
+        }
+
+        void* handle = mpv_create();
+        if (handle == NULL) {
+            std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+            job->library = library;
+            job->status = -3;
+            job->error = "mpv_create returned null";
+            dlclose(library);
+            job->library = NULL;
+            MediaKitAndroidHelperMpvInitializeAsyncEraseIfCancelledLocked(job_id, job);
+            return;
+        }
+
+        for (const auto& option : options) {
+            const int32_t result = mpv_set_option_string(handle, option.first.c_str(), option.second.c_str());
+            if (result < 0) {
+                std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+                job->library = library;
+                job->handle = handle;
+                job->status = result;
+                job->error = "mpv_set_option_string failed: " + option.first;
+                MediaKitAndroidHelperMpvInitializeAsyncDestroyHandleLocked(job);
+                dlclose(library);
+                job->library = NULL;
+                MediaKitAndroidHelperMpvInitializeAsyncEraseIfCancelledLocked(job_id, job);
+                return;
+            }
+        }
+
+        const int32_t result = mpv_initialize(handle);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started_at).count();
+        __android_log_print(
+                ANDROID_LOG_DEBUG,
+                "media_kit",
+                "mpv async init finish: %lld result=%d elapsed=%lldms",
+                (long long)job_id,
+                result,
+                (long long)elapsed_ms);
+
+        std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+        job->library = library;
+        job->handle = handle;
+        if (result < 0) {
+            job->status = result;
+            job->error = "mpv_initialize failed";
+            MediaKitAndroidHelperMpvInitializeAsyncDestroyHandleLocked(job);
+            dlclose(library);
+            job->library = NULL;
+            MediaKitAndroidHelperMpvInitializeAsyncEraseIfCancelledLocked(job_id, job);
+            return;
+        }
+        if (job->cancelled && !job->claimed) {
+            job->status = -4;
+            job->error = "initialization cancelled";
+            MediaKitAndroidHelperMpvInitializeAsyncDestroyHandleLocked(job);
+            dlclose(library);
+            job->library = NULL;
+            g_mpv_initialize_jobs.erase(job_id);
+            return;
+        }
+        job->status = 1;
+    }).detach();
+
+    return job_id;
+}
+
+extern "C" __attribute__ ((visibility ("default"))) int32_t MediaKitAndroidHelperMpvInitializeAsyncStatus(int64_t job_id) {
+    std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+    auto it = g_mpv_initialize_jobs.find(job_id);
+    if (it == g_mpv_initialize_jobs.end()) {
+        return -404;
+    }
+    return it->second->status;
+}
+
+extern "C" __attribute__ ((visibility ("default"))) intptr_t MediaKitAndroidHelperMpvInitializeAsyncHandle(int64_t job_id) {
+    std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+    auto it = g_mpv_initialize_jobs.find(job_id);
+    if (it == g_mpv_initialize_jobs.end() || it->second->status != 1 || it->second->handle == NULL) {
+        return 0;
+    }
+    it->second->claimed = true;
+    return reinterpret_cast<intptr_t>(it->second->handle);
+}
+
+extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperMpvInitializeAsyncError(
+        int64_t job_id,
+        char* result,
+        int32_t result_size) {
+    if (result == NULL || result_size <= 0) {
+        return;
+    }
+    result[0] = '\0';
+    std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+    auto it = g_mpv_initialize_jobs.find(job_id);
+    if (it == g_mpv_initialize_jobs.end()) {
+        strncpy(result, "job not found", result_size - 1);
+    } else {
+        strncpy(result, it->second->error.c_str(), result_size - 1);
+    }
+    result[result_size - 1] = '\0';
+}
+
+extern "C" __attribute__ ((visibility ("default"))) void MediaKitAndroidHelperMpvInitializeAsyncDispose(
+        int64_t job_id,
+        int8_t destroy_unclaimed) {
+    std::shared_ptr<MpvInitializeJob> job;
+    {
+        std::lock_guard<std::mutex> lock(g_mpv_initialize_jobs_mutex);
+        auto it = g_mpv_initialize_jobs.find(job_id);
+        if (it == g_mpv_initialize_jobs.end()) {
+            return;
+        }
+        job = it->second;
+        if (job->status == 0) {
+            // Pending jobs are cleaned up by the worker thread when it reaches
+            // a terminal state. This makes cancellation a single-call API.
+            job->cancelled = true;
+        }
+        if (destroy_unclaimed != 0 && !job->claimed && job->handle != NULL) {
+            MediaKitAndroidHelperMpvInitializeAsyncDestroyHandleLocked(job);
+            if (job->library != NULL) {
+                dlclose(job->library);
+                job->library = NULL;
+            }
+        }
+        if (job->status != 0) {
+            g_mpv_initialize_jobs.erase(it);
+        }
+    }
 }
 
 // ------------------------------------------------------------

@@ -14,9 +14,11 @@ target_link_options(mediakitandroidhelper PRIVATE "-Wl,-z,max-page-size=16384")
 
 find_library(log-lib log)
 find_library(android-lib android)
+find_library(dl-lib dl)
 
 target_link_libraries(
         mediakitandroidhelper
         ${log-lib}
         ${android-lib}
+        ${dl-lib}
 )
